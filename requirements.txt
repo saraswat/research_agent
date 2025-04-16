@@ -1,0 +1,18 @@
+
+# Core dependencies
+openai>=1.0.0
+requests>=2.25.0
+
+# Document processing
+beautifulsoup4>=4.9.0
+PyPDF2>=2.0.0
+python-docx>=0.8.0
+
+# Data analysis
+pandas>=1.0.0
+numpy>=1.20.0
+
+# Optional - for additional functionality
+matplotlib>=3.3.0  # For data visualization
+nltk>=3.6.0  # For NLP tasks
+scikit-learn>=1.0.0  # For machine learning capabilities
