@@ -78,20 +78,20 @@ Here's a design for an agent infrastructure using the OpenAI Agents library, aim
 
 Reaching the quality of Google Gemini Deep Research is a significant challenge and might not be fully achievable with the current OpenAI Agents library alone without substantial custom development and potentially access to similar underlying model capabilities and data. However, the following strategies can help improve the quality:
 
-•⁠  ⁠*Sophisticated Planning:* Implement a detailed and iterative planning process within the ⁠ ResearchAgent ⁠, allowing it to refine its research questions and strategies based on initial findings.
-•⁠  ⁠*Advanced Information Extraction:* Utilize more powerful NLP models for the ⁠ InformationExtractionTool ⁠ to capture nuanced information and relationships between concepts.
-•⁠  ⁠*Robust Citation Mechanism:* Invest heavily in the ⁠ CitationGenerationTool ⁠ to ensure accuracy, relevance, and consistency of citations. This might require advanced techniques for source tracking and claim verification.
-•⁠  ⁠*Multi-Source Synthesis:* Train the ⁠ ResearchAgent ⁠ to effectively synthesize information from multiple sources, identify conflicting information, and present a balanced perspective.
-•⁠  ⁠*Iterative Refinement:* Implement mechanisms for the agent to review and refine its findings and the generated report, potentially using self-critique or additional tool calls.
-•⁠  ⁠*High-Quality Web Search:* If OpenAI's built-in web search is insufficient, consider integrating with a more powerful and controllable search API.
-•⁠  ⁠*Long Context Handling:* Leverage models with large context windows (like those available through the OpenAI API) to process and reason over more extensive research materials.
+* *Sophisticated Planning:* Implement a detailed and iterative planning process within the ⁠ ResearchAgent ⁠, allowing it to refine its research questions and strategies based on initial findings.
+* *Advanced Information Extraction:* Utilize more powerful NLP models for the ⁠ InformationExtractionTool ⁠ to capture nuanced information and relationships between concepts.
+* *Robust Citation Mechanism:* Invest heavily in the ⁠ CitationGenerationTool ⁠ to ensure accuracy, relevance, and consistency of citations. This might require advanced techniques for source tracking and claim verification.
+* *Multi-Source Synthesis:* Train the ⁠ ResearchAgent ⁠ to effectively synthesize information from multiple sources, identify conflicting information, and present a balanced perspective.
+* ⁠*Iterative Refinement:* Implement mechanisms for the agent to review and refine its findings and the generated report, potentially using self-critique or additional tool calls.
+* *High-Quality Web Search:* If OpenAI's built-in web search is insufficient, consider integrating with a more powerful and controllable search API.
+* *Long Context Handling:* Leverage models with large context windows (like those available through the OpenAI API) to process and reason over more extensive research materials.
 
 *Limitations of OpenAI Agents Library:*
 
-•⁠  ⁠*Early Stage:* The OpenAI Agents library is relatively new, and its capabilities and robustness for complex tasks like in-depth research with citation might be limited compared to more mature platforms.
-•⁠  ⁠*Tool Development:* Creating custom tools, especially a sophisticated ⁠ CitationGenerationTool ⁠, requires significant development effort.
-•⁠  ⁠*Control over Models:* You are limited to the models available through the OpenAI API, and you don't have direct control over their training data or fine-tuning for specific research tasks.
-•⁠  ⁠*State Management and Persistence:* Managing the state of a long-running research process and ensuring persistence might require careful design.
+* ⁠*Early Stage:* The OpenAI Agents library is relatively new, and its capabilities and robustness for complex tasks like in-depth research with citation might be limited compared to more mature platforms.
+* *Tool Development:* Creating custom tools, especially a sophisticated ⁠ CitationGenerationTool ⁠, requires significant development effort.
+* *Control over Models:* You are limited to the models available through the OpenAI API, and you don't have direct control over their training data or fine-tuning for specific research tasks.
+* *State Management and Persistence:* Managing the state of a long-running research process and ensuring persistence might require careful design.
 
 *Conclusion:*
 
