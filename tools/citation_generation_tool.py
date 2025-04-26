@@ -5,26 +5,111 @@
 """
 Tool for generating citations for claims based on sources.
 """
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set, Tuple
 import re
 import datetime
+import hashlib
 
 class CitationGenerationTool:
     """Tool for generating citations for claims made in the research process."""
     
     def __init__(self):
         """Initialize the CitationGenerationTool."""
+        # Default citation style
         self.citation_style = "APA"
-        self.citation_db = []  # Database of generated citations
-        self.claim_citation_map = {}  # Map claims to citations
+        # Supported citation styles (all uppercase for consistent comparison)
+        self.supported_styles = ["APA", "MLA", "CHICAGO", "HARVARD", "IEEE", "VANCOUVER"]
+        # Database of generated citations
+        self.citation_db = []  
+        # Map claims to citations
+        self.claim_citation_map = {}  
+        # Track original sources to handle duplicates
+        self.source_hash_map = {}
     
-    def set_citation_style(self, style: str) -> None:
-        """Set the citation style to use."""
-        self.citation_style = style
+    def set_citation_style(self, style: str) -> Dict[str, Any]:
+        """
+        Set the citation style to use.
+        
+        Args:
+            style: The citation style to use (APA, MLA, Chicago, Harvard, IEEE, Vancouver)
+            
+        Returns:
+            A dictionary indicating success or failure
+        """
+        # Convert to uppercase for consistent comparison
+        style_upper = style.upper()
+        
+        # Map common variations to supported styles
+        style_map = {
+            "CHICAGO": "CHICAGO",
+            "CHICAGO STYLE": "CHICAGO",
+            "TURABIAN": "CHICAGO",
+            "MLA": "MLA",
+            "APA": "APA",
+            "HARVARD": "HARVARD",
+            "IEEE": "IEEE",
+            "VANCOUVER": "VANCOUVER"
+        }
+        
+        # Get the standardized style name if exists
+        standardized_style = style_map.get(style_upper, style_upper)
+        
+        if standardized_style in self.supported_styles:
+            self.citation_style = standardized_style
+            return {
+                "success": True,
+                "message": f"Citation style set to {standardized_style}",
+                "available_styles": self.supported_styles
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Unsupported citation style: {style}",
+                "available_styles": self.supported_styles
+            }
+    
+    def _generate_source_hash(self, source: Dict[str, Any]) -> str:
+        """
+        Generate a unique hash for a source to identify duplicates.
+        
+        Args:
+            source: Dictionary containing source information
+            
+        Returns:
+            A hash string uniquely identifying the source
+        """
+        # Extract key fields to use for hash calculation based on source type
+        if source.get("type") == "web" or source.get("source_type") == "web":
+            # For web sources, URL is the primary identifier
+            key = source.get("url", source.get("link", ""))
+        elif source.get("type") == "book" or source.get("source_type") == "book":
+            # For books, use a combination of author, title, and year
+            author = source.get("author", "")
+            title = source.get("title", "")
+            year = source.get("year", source.get("published_date", ""))
+            key = f"{author}|{title}|{year}"
+        elif source.get("type") == "journal" or source.get("source_type") == "journal":
+            # For journal articles, use DOI if available, otherwise author, title, journal
+            doi = source.get("doi", "")
+            if doi:
+                key = doi
+            else:
+                author = source.get("author", "")
+                title = source.get("title", "")
+                journal = source.get("journal", "")
+                year = source.get("year", source.get("published_date", ""))
+                key = f"{author}|{title}|{journal}|{year}"
+        else:
+            # Default approach for other source types
+            key = str(source)
+        
+        # Generate hash
+        return hashlib.md5(key.encode('utf-8')).hexdigest()
     
     def generate_citation(self, source: Dict[str, Any], claim: Optional[str] = None) -> Dict[str, Any]:
         """
         Generate a citation for a source and optionally associate it with a claim.
+        Handle source deduplication.
         
         Args:
             source: Dictionary containing source information
@@ -33,12 +118,46 @@ class CitationGenerationTool:
         Returns:
             A dictionary containing the generated citation
         """
+        # Calculate a hash for the source to check for duplicates
+        source_hash = self._generate_source_hash(source)
+        
+        # Check if this source has been cited before
+        if source_hash in self.source_hash_map:
+            # Reuse existing citation
+            citation_id = self.source_hash_map[source_hash]
+            citation = self.citation_db[citation_id]
+            
+            # Update claim mapping if needed
+            if claim:
+                if claim not in self.claim_citation_map:
+                    self.claim_citation_map[claim] = []
+                if citation_id not in self.claim_citation_map[claim]:
+                    self.claim_citation_map[claim].append(citation_id)
+            
+            return citation
+        
         # Generate the citation based on the source type and style
-        if source.get("type") == "web" or source.get("source_type") == "web":
+        if "type" in source:
+            source_type = source["type"]
+        elif "source_type" in source:
+            source_type = source["source_type"]
+        else:
+            # Attempt to infer source type from available fields
+            if "url" in source or "link" in source:
+                source_type = "web"
+            elif "publisher" in source:
+                source_type = "book"
+            elif "journal" in source:
+                source_type = "journal"
+            else:
+                # Default to web citation
+                source_type = "web"
+                
+        if source_type == "web":
             citation = self._generate_web_citation(source)
-        elif source.get("type") == "book" or source.get("source_type") == "book":
+        elif source_type == "book":
             citation = self._generate_book_citation(source)
-        elif source.get("type") == "journal" or source.get("source_type") == "journal":
+        elif source_type == "journal":
             citation = self._generate_journal_citation(source)
         else:
             # Default to web citation
@@ -48,6 +167,9 @@ class CitationGenerationTool:
         citation_id = len(self.citation_db)
         citation["id"] = citation_id
         self.citation_db.append(citation)
+        
+        # Store source hash for future deduplication
+        self.source_hash_map[source_hash] = citation_id
         
         # Map claim to citation if provided
         if claim:
@@ -68,7 +190,9 @@ class CitationGenerationTool:
         retrieved_date = source.get("retrieved_date", datetime.datetime.now().strftime("%Y-%m-%d"))
         
         # Format citation based on style
-        if self.citation_style == "APA":
+        style = self.citation_style  # Use a shorter variable name for readability
+        
+        if style == "APA":
             if author:
                 in_text = f"({author}, {published_date.split('-')[0] if published_date else 'n.d.'})"
                 reference = f"{author}. ({published_date.split('-')[0] if published_date else 'n.d.'}). {title}. {site_name}. Retrieved {retrieved_date}, from {url}"
@@ -76,7 +200,7 @@ class CitationGenerationTool:
                 in_text = f"({title}, {published_date.split('-')[0] if published_date else 'n.d.'})"
                 reference = f"{title}. ({published_date.split('-')[0] if published_date else 'n.d.'}). {site_name}. Retrieved {retrieved_date}, from {url}"
         
-        elif self.citation_style == "MLA":
+        elif style == "MLA":
             if author:
                 in_text = f"({author})"
                 reference = f"{author}. \"{title}.\" {site_name}, {published_date if published_date else 'n.d.'}, {url}. Accessed {retrieved_date}."
@@ -84,13 +208,38 @@ class CitationGenerationTool:
                 in_text = f"(\"{title}\")"
                 reference = f"\"{title}.\" {site_name}, {published_date if published_date else 'n.d.'}, {url}. Accessed {retrieved_date}."
         
-        elif self.citation_style == "Chicago":
+        elif style == "CHICAGO":
             if author:
                 in_text = f"({author}, {published_date.split('-')[0] if published_date else 'n.d.'})"
                 reference = f"{author}. \"{title}.\" {site_name}. {published_date if published_date else 'n.d.'}. {url}."
             else:
                 in_text = f"({site_name}, {published_date.split('-')[0] if published_date else 'n.d.'})"
                 reference = f"{site_name}. \"{title}.\" {published_date if published_date else 'n.d.'}. {url}."
+        
+        elif style == "HARVARD":
+            year = published_date.split('-')[0] if published_date else 'n.d.'
+            if author:
+                in_text = f"({author}, {year})"
+                reference = f"{author} ({year}) '{title}', {site_name}. Available at: {url} (Accessed: {retrieved_date})."
+            else:
+                in_text = f"({site_name}, {year})"
+                reference = f"{site_name} ({year}) '{title}'. Available at: {url} (Accessed: {retrieved_date})."
+        
+        elif style == "IEEE":
+            if author:
+                in_text = f"[{self._get_citation_number()}]"
+                reference = f"[{self._get_citation_number()}] {author}, \"{title},\" {site_name}, {published_date if published_date else 'n.d.'}. [Online]. Available: {url}. [Accessed: {retrieved_date}]."
+            else:
+                in_text = f"[{self._get_citation_number()}]"
+                reference = f"[{self._get_citation_number()}] \"{title},\" {site_name}, {published_date if published_date else 'n.d.'}. [Online]. Available: {url}. [Accessed: {retrieved_date}]."
+        
+        elif style == "VANCOUVER":
+            if author:
+                in_text = f"({self._get_citation_number()})"
+                reference = f"{self._get_citation_number()}. {author}. {title} [Internet]. {site_name}; {published_date if published_date else 'n.d.'} [cited {retrieved_date}]. Available from: {url}"
+            else:
+                in_text = f"({self._get_citation_number()})"
+                reference = f"{self._get_citation_number()}. {title} [Internet]. {site_name}; {published_date if published_date else 'n.d.'} [cited {retrieved_date}]. Available from: {url}"
         
         else:
             # Default format
@@ -111,6 +260,10 @@ class CitationGenerationTool:
                 "retrieved_date": retrieved_date
             }
         }
+        
+    def _get_citation_number(self) -> int:
+        """Get the next citation number for numbered citation styles like IEEE and Vancouver."""
+        return len(self.citation_db) + 1
     
     def _generate_book_citation(self, source: Dict[str, Any]) -> Dict[str, Any]:
         """Generate a citation for a book."""
@@ -122,17 +275,31 @@ class CitationGenerationTool:
         location = source.get("location", "")
         
         # Format citation based on style
-        if self.citation_style == "APA":
+        style = self.citation_style  # Use a shorter variable name for readability
+        
+        if style == "APA":
             in_text = f"({author}, {year})"
             reference = f"{author}. ({year}). {title}. {publisher}."
         
-        elif self.citation_style == "MLA":
+        elif style == "MLA":
             in_text = f"({author} {year})"
             reference = f"{author}. {title}. {publisher}, {year}."
         
-        elif self.citation_style == "Chicago":
+        elif style == "CHICAGO":
             in_text = f"({author}, {year})"
             reference = f"{author}. {title}. {location}: {publisher}, {year}."
+            
+        elif style == "HARVARD":
+            in_text = f"({author}, {year})"
+            reference = f"{author} ({year}) {title}. {location}: {publisher}."
+            
+        elif style == "IEEE":
+            in_text = f"[{self._get_citation_number()}]"
+            reference = f"[{self._get_citation_number()}] {author}, {title}. {location}: {publisher}, {year}."
+            
+        elif style == "VANCOUVER":
+            in_text = f"({self._get_citation_number()})"
+            reference = f"{self._get_citation_number()}. {author}. {title}. {location}: {publisher}; {year}."
         
         else:
             # Default format
@@ -166,17 +333,31 @@ class CitationGenerationTool:
         doi = source.get("doi", "")
         
         # Format citation based on style
-        if self.citation_style == "APA":
+        style = self.citation_style  # Use a shorter variable name for readability
+        
+        if style == "APA":
             in_text = f"({author}, {year})"
             reference = f"{author}. ({year}). {title}. {journal}, {volume}({issue}), {pages}. {f'https://doi.org/{doi}' if doi else ''}"
         
-        elif self.citation_style == "MLA":
+        elif style == "MLA":
             in_text = f"({author})"
             reference = f"{author}. \"{title}.\" {journal}, vol. {volume}, no. {issue}, {year}, pp. {pages}. {f'DOI: {doi}' if doi else ''}"
         
-        elif self.citation_style == "Chicago":
+        elif style == "CHICAGO":
             in_text = f"({author}, {year})"
             reference = f"{author}. \"{title}.\" {journal} {volume}, no. {issue} ({year}): {pages}. {f'https://doi.org/{doi}' if doi else ''}"
+        
+        elif style == "IEEE":
+            in_text = f"[{self._get_citation_number()}]"
+            reference = f"[{self._get_citation_number()}] {author}, \"{title},\" {journal}, vol. {volume}, no. {issue}, pp. {pages}, {year}. {f'DOI: {doi}' if doi else ''}"
+        
+        elif style == "HARVARD":
+            in_text = f"({author}, {year})"
+            reference = f"{author} ({year}) '{title}', {journal}, {volume}({issue}), pp. {pages}. {f'doi: {doi}' if doi else ''}"
+        
+        elif style == "VANCOUVER":
+            in_text = f"({self._get_citation_number()})"
+            reference = f"{self._get_citation_number()}. {author}. {title}. {journal}. {year};{volume}({issue}):{pages}. {f'doi: {doi}' if doi else ''}"
         
         else:
             # Default format
@@ -202,7 +383,7 @@ class CitationGenerationTool:
     
     def verify_claim(self, claim: str, source_content: str) -> Dict[str, Any]:
         """
-        Verify if a claim is supported by the source content.
+        Verify if a claim is supported by the source content using more sophisticated NLP techniques.
         
         Args:
             claim: The claim to verify
@@ -211,58 +392,189 @@ class CitationGenerationTool:
         Returns:
             A dictionary containing verification results
         """
-        # In a real implementation, this would use more sophisticated NLP techniques
-        # For demonstration, we'll use a simple similarity-based approach
-        
-        # Convert to lowercase for case-insensitive comparison
-        claim_lower = claim.lower()
-        content_lower = source_content.lower()
-        
-        # Check if the claim words appear in the content
-        claim_words = set(re.findall(r'\w+', claim_lower))
-        significant_words = [word for word in claim_words if len(word) > 3]  # Only consider words with > 3 chars
-        
-        found_words = 0
-        for word in significant_words:
-            if word in content_lower:
-                found_words += 1
-        
-        # Calculate a simple similarity score
-        if len(significant_words) > 0:
-            similarity = found_words / len(significant_words)
-        else:
-            similarity = 0
-        
-        verification_result = {
-            "claim": claim,
-            "supported": similarity > 0.7,  # Arbitrary threshold
-            "confidence": similarity,
-            "match_details": {
-                "significant_words": len(significant_words),
-                "found_words": found_words
+        try:
+            # Import NLTK components for better text analysis
+            import nltk
+            from nltk.tokenize import sent_tokenize, word_tokenize
+            from nltk.corpus import stopwords
+            from nltk.stem import WordNetLemmatizer
+            from nltk import pos_tag
+            
+            # Download NLTK resources if needed
+            try:
+                stopwords.words('english')
+            except LookupError:
+                nltk.download('stopwords', quiet=True)
+            
+            try:
+                nltk.data.find('taggers/averaged_perceptron_tagger')
+            except LookupError:
+                nltk.download('averaged_perceptron_tagger', quiet=True)
+                
+            try:
+                nltk.data.find('corpora/wordnet')
+            except LookupError:
+                nltk.download('wordnet', quiet=True)
+                
+            # Download punkt tokenizer
+            try:
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                nltk.download('punkt', quiet=True)
+                
+            # Initialize lemmatizer for word normalization
+            lemmatizer = WordNetLemmatizer()
+            stop_words = set(stopwords.words('english'))
+            
+            # Preprocess claim
+            claim_tokens = word_tokenize(claim.lower())
+            claim_pos = pos_tag(claim_tokens)
+            
+            # Extract key terms (nouns, verbs, adjectives) from claim
+            key_terms = []
+            for word, tag in claim_pos:
+                if tag.startswith('N') or tag.startswith('V') or tag.startswith('J'):
+                    if word not in stop_words and len(word) > 2:
+                        lemma = lemmatizer.lemmatize(word)
+                        key_terms.append(lemma)
+            
+            # Break source content into sentences for more granular analysis
+            sentences = sent_tokenize(source_content)
+            
+            # Track supporting evidence
+            supporting_sentences = []
+            term_match_count = 0
+            
+            # For each sentence in the source, calculate similarity to claim
+            for sentence in sentences:
+                sent_tokens = word_tokenize(sentence.lower())
+                sent_lemmas = [lemmatizer.lemmatize(w) for w in sent_tokens if w not in stop_words]
+                
+                # Count matching terms in this sentence
+                matches = 0
+                matching_terms = []
+                for term in key_terms:
+                    if term in sent_lemmas:
+                        matches += 1
+                        matching_terms.append(term)
+                
+                # If this sentence has significant overlap, consider it supporting evidence
+                if matches > 0 and matches / len(key_terms) > 0.3:  # At least 30% match
+                    term_match_count += matches
+                    supporting_sentences.append({
+                        "sentence": sentence,
+                        "matching_terms": matching_terms,
+                        "match_ratio": round(matches / len(key_terms), 2)
+                    })
+            
+            # Calculate overall confidence based on term coverage and supporting sentences
+            if len(key_terms) > 0:
+                # How many key terms were found at least once
+                term_coverage = min(1.0, term_match_count / len(key_terms))
+                
+                # How many supporting sentences were found
+                evidence_strength = min(1.0, len(supporting_sentences) / 3)  # Cap at 3 sentences
+                
+                # Weighted combination
+                confidence = 0.7 * term_coverage + 0.3 * evidence_strength
+            else:
+                confidence = 0.0
+            
+            # Determine if claim is supported
+            supported = confidence > 0.6  # Threshold for support
+            
+            # Detailed verification result
+            verification_result = {
+                "claim": claim,
+                "supported": supported,
+                "confidence": round(confidence, 2),
+                "key_terms": key_terms,
+                "supporting_evidence": supporting_sentences,
+                "match_details": {
+                    "key_terms_found": term_match_count,
+                    "total_key_terms": len(key_terms),
+                    "supporting_sentences": len(supporting_sentences)
+                }
             }
-        }
-        
-        return verification_result
+            
+            return verification_result
+            
+        except ImportError:
+            # Fall back to simpler implementation if NLTK can't be used
+            # Convert to lowercase for case-insensitive comparison
+            claim_lower = claim.lower()
+            content_lower = source_content.lower()
+            
+            # Check if the claim words appear in the content
+            claim_words = set(re.findall(r'\w+', claim_lower))
+            significant_words = [word for word in claim_words if len(word) > 3]  # Only consider words with > 3 chars
+            
+            found_words = 0
+            for word in significant_words:
+                if word in content_lower:
+                    found_words += 1
+            
+            # Calculate a simple similarity score
+            if len(significant_words) > 0:
+                similarity = found_words / len(significant_words)
+            else:
+                similarity = 0
+            
+            verification_result = {
+                "claim": claim,
+                "supported": similarity > 0.7,  # Arbitrary threshold
+                "confidence": similarity,
+                "match_details": {
+                    "significant_words": len(significant_words),
+                    "found_words": found_words
+                }
+            }
+            
+            return verification_result
     
     def generate_bibliography(self) -> Dict[str, Any]:
         """
         Generate a bibliography from all citations in the database.
+        Handle multiple versions of the same source properly.
         
         Returns:
             A dictionary containing the bibliography
         """
+        # Get unique references (preventing duplicates)
         references = []
-        for citation in self.citation_db:
-            references.append(citation["reference"])
+        seen_sources = set()
+        source_info = []
         
-        # Sort references alphabetically (typical for most citation styles)
-        references.sort()
+        # Sort citations by appropriate key based on citation style
+        if self.citation_style in ["IEEE", "VANCOUVER"]:
+            # For numbered styles, order by citation number
+            sorted_citations = sorted(self.citation_db, key=lambda c: c.get("id", 0))
+        else:
+            # For author/date styles, sort alphabetically
+            sorted_citations = sorted(self.citation_db, 
+                                      key=lambda c: c.get("source_data", {}).get("author", 
+                                             c.get("source_data", {}).get("title", "")))
+        
+        # Add references to bibliography
+        for citation in sorted_citations:
+            source_hash = self._generate_source_hash(citation.get("source_data", {}))
+            if source_hash not in seen_sources:
+                seen_sources.add(source_hash)
+                references.append(citation["reference"])
+                
+                # Add detailed source info
+                source_data = citation.get("source_data", {})
+                source_info.append({
+                    "id": citation.get("id"),
+                    "type": citation.get("source_type"),
+                    "data": source_data
+                })
         
         return {
             "references": references,
             "style": self.citation_style,
-            "count": len(references)
+            "count": len(references),
+            "source_info": source_info
         }
     
     def get_citation_for_claim(self, claim: str) -> List[Dict[str, Any]]:
@@ -280,3 +592,158 @@ class CitationGenerationTool:
             return [self.citation_db[cid] for cid in citation_ids]
         else:
             return []
+    
+    def manage_citation_versions(self, source_id: int, updated_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Manage multiple versions of the same source, updating all citations.
+        
+        Args:
+            source_id: The ID of the citation to update
+            updated_data: The updated source data
+            
+        Returns:
+            A dictionary containing the result of the operation
+        """
+        if source_id < 0 or source_id >= len(self.citation_db):
+            return {
+                "success": False,
+                "message": f"Citation with ID {source_id} not found"
+            }
+            
+        # Get the original citation
+        original_citation = self.citation_db[source_id]
+        original_hash = self._generate_source_hash(original_citation.get("source_data", {}))
+        
+        # Find all citations using this source
+        affected_citations = []
+        for i, citation in enumerate(self.citation_db):
+            citation_hash = self._generate_source_hash(citation.get("source_data", {}))
+            if citation_hash == original_hash:
+                affected_citations.append(i)
+                
+        # Update all affected citations
+        for citation_id in affected_citations:
+            # Update source data
+            for key, value in updated_data.items():
+                self.citation_db[citation_id]["source_data"][key] = value
+                
+            # Re-generate the citation with the new data
+            source_type = self.citation_db[citation_id].get("source_type")
+            if source_type == "web":
+                updated_citation = self._generate_web_citation(self.citation_db[citation_id]["source_data"])
+            elif source_type == "book":
+                updated_citation = self._generate_book_citation(self.citation_db[citation_id]["source_data"])
+            elif source_type == "journal":
+                updated_citation = self._generate_journal_citation(self.citation_db[citation_id]["source_data"])
+            else:
+                updated_citation = self._generate_web_citation(self.citation_db[citation_id]["source_data"])
+                
+            # Preserve the original ID
+            updated_citation["id"] = self.citation_db[citation_id]["id"]
+            
+            # Update the citation in the database
+            self.citation_db[citation_id].update(updated_citation)
+            
+        # Generate a new hash for the updated source and update the source hash map
+        new_hash = self._generate_source_hash(self.citation_db[source_id]["source_data"])
+        if original_hash in self.source_hash_map:
+            self.source_hash_map[new_hash] = self.source_hash_map.pop(original_hash)
+            
+        return {
+            "success": True,
+            "message": f"Updated {len(affected_citations)} citation(s) with new source information",
+            "affected_citations": affected_citations
+        }
+    
+    def export_citations(self, format_type: str = "plain") -> Dict[str, Any]:
+        """
+        Export all citations in a specific format.
+        
+        Args:
+            format_type: The format to export (plain, html, bibtex, etc.)
+            
+        Returns:
+            A dictionary containing the exported citations
+        """
+        bibliography = self.generate_bibliography()
+        references = bibliography["references"]
+        
+        if format_type == "plain":
+            # Plain text format
+            export_text = "\n\n".join(references)
+            
+        elif format_type == "html":
+            # HTML format
+            export_text = "<h2>Bibliography</h2>\n<ul>\n"
+            for ref in references:
+                export_text += f"<li>{ref}</li>\n"
+            export_text += "</ul>"
+            
+        elif format_type == "bibtex":
+            # BibTeX format
+            export_text = ""
+            for i, citation in enumerate(self.citation_db):
+                source_data = citation.get("source_data", {})
+                source_type = citation.get("source_type", "misc")
+                
+                # Generate a unique BibTeX key
+                author_part = source_data.get("author", "Unknown").split()[0] if source_data.get("author") else "Unknown"
+                year_part = source_data.get("year", source_data.get("published_date", ""))[:4] if source_data.get("year", source_data.get("published_date", "")) else "nd"
+                key = f"{author_part}{year_part}{i}"
+                
+                # Map our source types to BibTeX entry types
+                bibtex_type = {
+                    "web": "misc",
+                    "book": "book",
+                    "journal": "article"
+                }.get(source_type, "misc")
+                
+                # Start BibTeX entry
+                export_text += f"@{bibtex_type}{{{key},\n"
+                
+                # Add fields based on source type
+                if source_type == "web":
+                    if source_data.get("author"):
+                        export_text += f"  author = {{{source_data.get('author')}}},\n"
+                    export_text += f"  title = {{{source_data.get('title', 'Untitled')}}},\n"
+                    if source_data.get("published_date"):
+                        export_text += f"  year = {{{source_data.get('published_date', '')[:4]}}},\n"
+                    export_text += f"  url = {{{source_data.get('url', '')}}},\n"
+                    export_text += f"  note = {{Accessed on {source_data.get('retrieved_date', '')}}}\n"
+                    
+                elif source_type == "book":
+                    export_text += f"  author = {{{source_data.get('author', 'Unknown')}}},\n"
+                    export_text += f"  title = {{{source_data.get('title', 'Untitled')}}},\n"
+                    export_text += f"  year = {{{source_data.get('year', '')}}},\n"
+                    export_text += f"  publisher = {{{source_data.get('publisher', '')}}},\n"
+                    if source_data.get("location"):
+                        export_text += f"  address = {{{source_data.get('location', '')}}}\n"
+                    
+                elif source_type == "journal":
+                    export_text += f"  author = {{{source_data.get('author', 'Unknown')}}},\n"
+                    export_text += f"  title = {{{source_data.get('title', 'Untitled')}}},\n"
+                    export_text += f"  journal = {{{source_data.get('journal', '')}}},\n"
+                    if source_data.get("volume"):
+                        export_text += f"  volume = {{{source_data.get('volume', '')}}},\n"
+                    if source_data.get("issue"):
+                        export_text += f"  number = {{{source_data.get('issue', '')}}},\n"
+                    export_text += f"  year = {{{source_data.get('year', '')}}},\n"
+                    if source_data.get("pages"):
+                        export_text += f"  pages = {{{source_data.get('pages', '')}}},\n"
+                    if source_data.get("doi"):
+                        export_text += f"  doi = {{{source_data.get('doi', '')}}}\n"
+                
+                # Close BibTeX entry
+                export_text += "}\n\n"
+                
+        else:
+            # Default to plain text
+            export_text = "\n\n".join(references)
+            
+        return {
+            "success": True,
+            "format": format_type,
+            "style": self.citation_style,
+            "count": len(references),
+            "content": export_text
+        }
