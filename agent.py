@@ -2,7 +2,7 @@
 """
 Main ResearchAgent implementation that orchestrates the research process.
 """
-from typing import List, Dict, Any, Optional, Union, Tuple
+from typing import List, Dict, Any, Optional, Union, Tuple, Literal
 import os
 import time
 import json
@@ -10,11 +10,24 @@ import logging
 import uuid
 import datetime
 import traceback
+import re
 from pathlib import Path
 
-import openai
-from openai.agent import Agent, Tool
-from openai.error import OpenAIError
+# Import backends (conditionally to handle cases where one might not be installed)
+try:
+    import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    import openai
+    from openai.types.chat import ChatCompletion
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 from .tools.web_search_tool import WebSearchTool
 from .tools.document_analysis_tool import DocumentAnalysisTool
@@ -38,6 +51,14 @@ class ResearchError(Exception):
 class APIConfigError(ResearchError):
     """Exception raised for API configuration issues."""
     pass
+    
+class GeminiError(ResearchError):
+    """Exception raised for issues with the Gemini API."""
+    pass
+    
+class OpenAIError(ResearchError):
+    """Exception raised for issues with the OpenAI API."""
+    pass
 
 class ResearchStateError(ResearchError):
     """Exception raised for issues with the research state."""
@@ -57,21 +78,32 @@ class ResearchAgent:
     def __init__(
         self, 
         api_key: str, 
-        model: str = "gpt-4-turbo",
+        backend: Literal["gemini", "openai"] = "gemini",
+        model: str = None,
         checkpoint_dir: Optional[str] = None,
-        log_level: str = "INFO"
+        log_level: str = "INFO",
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        max_tokens: int = 4096
     ):
         """
         Initialize the ResearchAgent.
         
         Args:
-            api_key: OpenAI API key
-            model: The model to use for the agent (default: gpt-4-turbo)
+            api_key: API key for the selected backend (Google or OpenAI)
+            backend: The LLM backend to use: "gemini" or "openai" (default: "gemini")
+            model: The model to use for the agent (default depends on backend)
             checkpoint_dir: Directory to save research checkpoints (default: None)
             log_level: Logging level (default: INFO)
+            temperature: Controls randomness in response generation (default: 0.7)
+            top_p: Nucleus sampling parameter (default: 0.95)
+            top_k: Top-k sampling parameter (default: 40, only used for Gemini)
+            max_tokens: Maximum tokens in response (default: 4096)
         
         Raises:
             APIConfigError: If the API key is invalid or not provided
+            ImportError: If the selected backend is not available
         """
         # Configure logging
         self._configure_logging(log_level)
@@ -79,18 +111,35 @@ class ResearchAgent:
         # Validate API key
         if not api_key:
             logger.error("No API key provided")
-            raise APIConfigError("OpenAI API key is required")
+            raise APIConfigError("API key is required")
         
         # Initialize basic properties
         self.api_key = api_key
-        self.model = model
+        self.backend = backend
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.max_tokens = max_tokens
         
-        try:
-            openai.api_key = api_key
-            logger.info(f"Initialized with model: {model}")
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI API: {str(e)}")
-            raise APIConfigError(f"Failed to initialize OpenAI API: {str(e)}")
+        # Set default model based on backend if not provided
+        if model is None:
+            if backend == "gemini":
+                self.model = "gemini-1.5-pro"
+            elif backend == "openai":
+                self.model = "gpt-4o"
+            else:
+                raise APIConfigError(f"Unknown backend: {backend}")
+        else:
+            self.model = model
+            
+        # Initialize the specified backend
+        if backend == "gemini":
+            self._init_gemini_backend()
+        elif backend == "openai":
+            self._init_openai_backend()
+        else:
+            logger.error(f"Unsupported backend: {backend}")
+            raise APIConfigError(f"Unsupported backend: {backend}. Choose 'gemini' or 'openai'.")
         
         # Set up checkpoint directory
         self.checkpoint_dir = checkpoint_dir
@@ -107,6 +156,83 @@ class ResearchAgent:
         
         # Initialize agent state with metadata
         self._init_research_state()
+        
+    def _init_gemini_backend(self):
+        """Initialize the Gemini backend."""
+        if not GEMINI_AVAILABLE:
+            logger.error("Google Gemini package not installed")
+            raise ImportError("To use Gemini backend, install google-generativeai package")
+            
+        try:
+            # Configure Gemini API
+            genai.configure(api_key=self.api_key)
+            
+            # Set default generation configuration
+            self.generation_config = GenerationConfig(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                max_output_tokens=self.max_tokens,
+            )
+            
+            # Verify model is available
+            models = genai.list_models()
+            available_models = [m.name for m in models]
+            # Extract just the model name without the full path
+            model_short_name = self.model.split('/')[-1] if '/' in self.model else self.model
+            
+            if not any(model_short_name in m for m in available_models):
+                available_gemini_models = [m for m in available_models if 'gemini' in m]
+                logger.warning(f"Model {self.model} not found in available models. Available Gemini models: {available_gemini_models}")
+                if available_gemini_models:
+                    self.model = available_gemini_models[0]
+                    logger.info(f"Using alternative model: {self.model}")
+                else:
+                    raise APIConfigError(f"No Gemini models available")
+            
+            logger.info(f"Initialized with Gemini model: {self.model}")
+            
+            # Initialize the model
+            self.gemini_model = genai.GenerativeModel(model_name=self.model, 
+                                                     generation_config=self.generation_config)
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini API: {str(e)}")
+            raise APIConfigError(f"Failed to initialize Gemini API: {str(e)}")
+            
+    def _init_openai_backend(self):
+        """Initialize the OpenAI backend."""
+        if not OPENAI_AVAILABLE:
+            logger.error("OpenAI package not installed")
+            raise ImportError("To use OpenAI backend, install openai package")
+            
+        try:
+            # Initialize OpenAI client
+            self.openai_client = OpenAI(api_key=self.api_key)
+            
+            # Initialize OpenAI models list to validate model name
+            available_models = []
+            try:
+                models_response = self.openai_client.models.list()
+                available_models = [model.id for model in models_response.data]
+            except Exception as e:
+                logger.warning(f"Could not list OpenAI models: {str(e)}")
+                
+            # Check if model exists or use default
+            if available_models and self.model not in available_models:
+                # Try to find a suitable alternative
+                if "gpt-4" in available_models:
+                    self.model = "gpt-4"
+                elif "gpt-3.5-turbo" in available_models:
+                    self.model = "gpt-3.5-turbo"
+                    
+                logger.warning(f"Selected model not found, using alternative: {self.model}")
+                
+            logger.info(f"Initialized with OpenAI model: {self.model}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI API: {str(e)}")
+            raise APIConfigError(f"Failed to initialize OpenAI API: {str(e)}")
     
     def _configure_logging(self, log_level: str) -> None:
         """Configure the logger based on the specified level."""
@@ -139,45 +265,123 @@ class ResearchAgent:
             self.data_analysis_tool = DataAnalysisTool()
             logger.debug("DataAnalysisTool initialized")
             
-            # Create the OpenAI agent tools list
-            self.tools = [
-                Tool(
-                    name="web_search",
-                    description="Search the web for information related to the research topic",
-                    function=self._safe_tool_call(self.web_search_tool.search, "web_search")
-                ),
-                Tool(
-                    name="document_analysis",
-                    description="Analyze and extract text from documents",
-                    function=self._safe_tool_call(self.document_analysis_tool.analyze, "document_analysis")
-                ),
-                Tool(
-                    name="information_extraction",
-                    description="Extract specific information from text",
-                    function=self._safe_tool_call(self.information_extraction_tool.extract, "information_extraction")
-                ),
-                Tool(
-                    name="citation_generation",
-                    description="Generate citations for claims based on sources",
-                    function=self._safe_tool_call(self.citation_generation_tool.generate_citation, "citation_generation")
-                ),
-                Tool(
-                    name="report_generation",
-                    description="Generate a structured research report",
-                    function=self._safe_tool_call(self.report_generation_tool.generate_report, "report_generation")
-                ),
-                Tool(
-                    name="data_analysis",
-                    description="Analyze numerical or structured data",
-                    function=self._safe_tool_call(self.data_analysis_tool.analyze, "data_analysis")
-                )
-            ]
-            logger.info("All research tools initialized successfully")
+            # Define tool schemas for both backends
+            self.tool_schemas = {
+                "WebSearch": {
+                    "name": "WebSearch",
+                    "description": "Search the web for current information on a topic",
+                    "function": self.web_search_tool.search,
+                    "parameters": {
+                        "properties": {
+                            "query": {"type": "string", "description": "The search query"},
+                            "num_results": {"type": "integer", "description": "Number of results to return"}
+                        },
+                        "required": ["query"]
+                    }
+                },
+                "DocumentAnalysis": {
+                    "name": "DocumentAnalysis",
+                    "description": "Analyze a document URL or file path",
+                    "function": self.document_analysis_tool.analyze,
+                    "parameters": {
+                        "properties": {
+                            "document_source": {"type": "string", "description": "The URL or file path of the document"},
+                            "document_type": {"type": "string", "description": "The document type (optional)"}
+                        },
+                        "required": ["document_source"]
+                    }
+                },
+                "InformationExtraction": {
+                    "name": "InformationExtraction",
+                    "description": "Extract specific information from text",
+                    "function": self.information_extraction_tool.extract,
+                    "parameters": {
+                        "properties": {
+                            "text": {"type": "string", "description": "The text to extract information from"},
+                            "instructions": {"type": "string", "description": "Instructions on what information to extract"},
+                            "source": {"type": "string", "description": "Optional source reference for citation purposes"},
+                            "fact_check": {"type": "boolean", "description": "Whether to perform fact checking"}
+                        },
+                        "required": ["text", "instructions"]
+                    }
+                },
+                "CitationGeneration": {
+                    "name": "CitationGeneration",
+                    "description": "Generate a citation for a claim based on a source",
+                    "function": self.citation_generation_tool.generate_citation,
+                    "parameters": {
+                        "properties": {
+                            "claim": {"type": "string", "description": "The claim to cite"},
+                            "source": {"type": "object", "description": "The source information for the citation"}
+                        },
+                        "required": ["claim", "source"]
+                    }
+                },
+                "DataAnalysis": {
+                    "name": "DataAnalysis",
+                    "description": "Analyze numerical or structured data",
+                    "function": self.data_analysis_tool.analyze,
+                    "parameters": {
+                        "properties": {
+                            "data": {"type": "object", "description": "The data to analyze"},
+                            "analysis_type": {"type": "string", "description": "The type of analysis to perform"},
+                            "parameters": {"type": "object", "description": "Optional parameters for the analysis"}
+                        },
+                        "required": ["data", "analysis_type"]
+                    }
+                },
+                "ReportGeneration": {
+                    "name": "ReportGeneration",
+                    "description": "Generate a structured research report",
+                    "function": self.report_generation_tool.generate_report,
+                    "parameters": {
+                        "properties": {
+                            "title": {"type": "string", "description": "The report title"},
+                            "data": {"type": "object", "description": "The research data to include in the report"},
+                            "format": {"type": "string", "description": "The output format (markdown, html, etc.)"},
+                            "style": {"type": "string", "description": "The citation style to use"}
+                        },
+                        "required": ["title", "data"]
+                    }
+                }
+            }
+            
+            # Set up tools based on the backend
+            if self.backend == "openai":
+                # Set up OpenAI-compatible tools
+                self._init_openai_tools()
+            else:
+                # Gemini tools are defined in the tool_schemas dict
+                self.tools = self.tool_schemas
+            
+            logger.info(f"All research tools initialized successfully for {self.backend} backend")
             
         except Exception as e:
             logger.error(f"Error initializing tools: {str(e)}")
             self._log_exception("Tool initialization failed")
             raise ToolError(f"Failed to initialize research tools: {str(e)}")
+            
+    def _init_openai_tools(self) -> None:
+        """Initialize tools for the OpenAI backend."""
+        self.openai_tools = []
+        
+        for tool_id, tool_info in self.tool_schemas.items():
+            # Convert our tool schema to OpenAI format
+            openai_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool_id.lower(),
+                    "description": tool_info["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": tool_info["parameters"]["properties"],
+                        "required": tool_info["parameters"]["required"]
+                    }
+                }
+            }
+            self.openai_tools.append(openai_tool)
+            
+        logger.debug(f"Initialized {len(self.openai_tools)} OpenAI tools")
     
     def _safe_tool_call(self, tool_function, tool_name: str):
         """Wrap a tool function with error handling to make it safer."""
@@ -289,12 +493,12 @@ class ResearchAgent:
                 "traceback": exc_info
             })
     
-    def create_agent(self) -> Agent:
+    def create_agent(self):
         """
-        Create and return an OpenAI Agent instance with research capabilities.
+        Set up the research agent with appropriate tools and configuration.
         
         Returns:
-            An OpenAI Agent instance configured for research
+            The configured model (either Gemini or OpenAI)
             
         Raises:
             APIConfigError: If there's an issue creating the agent
@@ -306,11 +510,11 @@ class ResearchAgent:
             
             Follow these steps for any research task:
             1. Analyze the research problem and break it down into sub-questions
-            2. For each sub-question, search for relevant information using web_search
-            3. Analyze documents and extract key information using document_analysis and information_extraction
-            4. For each claim or piece of information, generate a proper citation using citation_generation
-            5. Synthesize findings into a comprehensive report using report_generation
-            6. If you encounter data that needs analysis, use data_analysis
+            2. For each sub-question, search for relevant information using WebSearch
+            3. Analyze documents and extract key information using DocumentAnalysis and InformationExtraction
+            4. For each claim or piece of information, generate a proper citation using CitationGeneration
+            5. Synthesize findings into a comprehensive report
+            6. If you encounter data that needs analysis, use DataAnalysis
             
             Always maintain academic integrity by:
             - Citing all sources properly
@@ -321,25 +525,70 @@ class ResearchAgent:
             If you encounter any errors while using tools, try an alternative approach or skip to the next part of your research if necessary. Document any limitations in your final report.
             """
             
-            # Create agent
-            agent = Agent(
-                model=self.model,
-                tools=self.tools,
-                instructions=instructions
-            )
-            
-            logger.info(f"Created agent with model {self.model} and {len(self.tools)} tools")
-            return agent
-            
-        except OpenAIError as e:
-            logger.error(f"OpenAI API error creating agent: {str(e)}")
-            self._log_exception("Failed to create agent")
-            raise APIConfigError(f"Failed to create OpenAI agent: {str(e)}")
+            # Create the agent based on selected backend
+            if self.backend == "gemini":
+                return self._create_gemini_agent(instructions)
+            elif self.backend == "openai":
+                return self._create_openai_agent(instructions)
+            else:
+                raise APIConfigError(f"Unknown backend: {self.backend}")
             
         except Exception as e:
-            logger.error(f"Unexpected error creating agent: {str(e)}")
+            logger.error(f"Error creating agent: {str(e)}")
             self._log_exception("Failed to create agent")
-            raise ResearchError(f"Failed to create agent: {str(e)}")
+            raise APIConfigError(f"Failed to create agent: {str(e)}")
+            
+    def _create_gemini_agent(self, instructions: str):
+        """
+        Create a Gemini-based research agent.
+        
+        Args:
+            instructions: System instructions for the agent
+            
+        Returns:
+            The configured Gemini model
+        """
+        try:
+            # The tools were already initialized in _init_tools
+            
+            # Update the model with the system instructions
+            self.gemini_model = genai.GenerativeModel(
+                model_name=self.model,
+                generation_config=self.generation_config,
+                system_instruction=instructions
+            )
+            
+            logger.info(f"Created agent with Gemini model {self.model} and {len(self.tools)} tools")
+            return self.gemini_model
+            
+        except Exception as e:
+            logger.error(f"Error creating Gemini agent: {str(e)}")
+            self._log_exception("Failed to create Gemini agent")
+            raise GeminiError(f"Failed to create Gemini agent: {str(e)}")
+            
+    def _create_openai_agent(self, instructions: str):
+        """
+        Create an OpenAI-based research agent.
+        
+        Args:
+            instructions: System instructions for the agent
+            
+        Returns:
+            The OpenAI client
+        """
+        try:
+            # The OpenAI tools were already initialized in _init_openai_tools
+            
+            # Store the system instructions for later use
+            self.openai_system_instructions = instructions
+            
+            logger.info(f"Created agent with OpenAI model {self.model} and {len(self.openai_tools)} tools")
+            return self.openai_client
+            
+        except Exception as e:
+            logger.error(f"Error creating OpenAI agent: {str(e)}")
+            self._log_exception("Failed to create OpenAI agent")
+            raise OpenAIError(f"Failed to create OpenAI agent: {str(e)}")
     
     def conduct_research(self, 
                         research_problem: str, 
@@ -412,9 +661,15 @@ class ResearchAgent:
                     self._update_research_state({"status": "timeout"})
                     break
                 
-                # Run the agent
+                # Run the agent based on the selected backend
                 try:
-                    result = agent.run(current_message)
+                    # Query the selected backend
+                    if self.backend == "gemini":
+                        result = self._query_gemini(current_message)
+                    elif self.backend == "openai":
+                        result = self._query_openai(current_message)
+                    else:
+                        raise APIConfigError(f"Unknown backend: {self.backend}")
                     
                     # Process the agent's output and update the research state
                     self._process_agent_output(result)
@@ -426,11 +681,11 @@ class ResearchAgent:
                     
                     logger.info(f"Completed research iteration {iterations}")
                     
-                except OpenAIError as e:
-                    logger.error(f"OpenAI API error: {str(e)}")
+                except Exception as e:
+                    logger.error(f"{self.backend.capitalize()} API error: {str(e)}")
                     self._log_exception(f"Error in research iteration {iterations}")
                     self._update_research_state({"status": "error"})
-                    raise ResearchError(f"OpenAI API error during research: {str(e)}")
+                    raise ResearchError(f"{self.backend.capitalize()} API error during research: {str(e)}")
                 
                 # Check if it's time to save a checkpoint
                 current_time = time.time()
@@ -494,6 +749,447 @@ class ResearchAgent:
         
         # Default: ask for improvements
         return "Please review the current research and identify any gaps or areas that need more depth. Then improve the report accordingly."
+    
+    def _query_gemini(self, user_message: str) -> Dict[str, Any]:
+        """
+        Query the Gemini model and process any tool calls.
+        
+        Args:
+            user_message: The user's message to send to Gemini
+            
+        Returns:
+            A dictionary containing the model's response and any tool outputs
+            
+        Raises:
+            GeminiError: If there's an issue with the Gemini API
+        """
+        try:
+            logger.info("Sending query to Gemini")
+            
+            # Start a chat session
+            chat = self.gemini_model.start_chat(history=[])
+            
+            # Get the model's response
+            response = chat.send_message(user_message)
+            
+            # Process tool calls if the model requests them
+            result = {
+                "messages": [],
+                "report": response.text
+            }
+            
+            # Check for potential tool calls in the response
+            # Gemini doesn't have a standardized tool calling format like OpenAI,
+            # so we need to parse the response text to identify tool requests
+            
+            # Parse the response for tool calls - we're looking for patterns like:
+            # "I'll use the WebSearch tool to find information about..."
+            # "Let me use InformationExtraction to analyze..."
+            tool_patterns = [
+                (r'use (?:the )?(WebSearch)(.*?)(?:to|:)(.*?)(?:\.|$)', "WebSearch", ["query"]),
+                (r'use (?:the )?(DocumentAnalysis)(.*?)(?:to|:)(.*?)(?:\.|$)', "DocumentAnalysis", ["document_source"]),
+                (r'use (?:the )?(InformationExtraction)(.*?)(?:to|:)(.*?)(?:\.|$)', "InformationExtraction", ["text", "instructions"]),
+                (r'use (?:the )?(CitationGeneration)(.*?)(?:to|:)(.*?)(?:\.|$)', "CitationGeneration", ["claim", "source"]),
+                (r'use (?:the )?(DataAnalysis)(.*?)(?:to|:)(.*?)(?:\.|$)', "DataAnalysis", ["data", "analysis_type"])
+            ]
+            
+            # Track all tool outputs
+            tool_outputs = []
+            
+            # Extract and execute tool calls
+            for pattern, tool_name, required_params in tool_patterns:
+                matches = re.finditer(pattern, response.text, re.IGNORECASE | re.DOTALL)
+                
+                for match in matches:
+                    # Extract the tool name and potential arguments
+                    tool_args_text = match.group(3).strip()
+                    
+                    # Parse arguments (this is a simplified approach)
+                    tool_args = self._parse_tool_args(tool_args_text, tool_name)
+                    
+                    # Check if required parameters are present
+                    if all(param in tool_args for param in required_params):
+                        # Execute the tool
+                        try:
+                            tool_result = self.tools[tool_name]["function"](**tool_args)
+                            
+                            # Log tool usage
+                            self._log_tool_usage(tool_name, tool_args, True, tool_result)
+                            
+                            # Add tool output to results
+                            tool_outputs.append({
+                                "tool_name": tool_name,
+                                "args": tool_args,
+                                "result": tool_result
+                            })
+                            
+                        except Exception as e:
+                            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+                            self._log_tool_usage(tool_name, tool_args, False, str(e))
+                            
+                            # Add error information
+                            tool_outputs.append({
+                                "tool_name": tool_name,
+                                "args": tool_args,
+                                "error": str(e)
+                            })
+            
+            # If we have tool outputs, send a follow-up message with the results
+            if tool_outputs:
+                tool_results_text = self._format_tool_results(tool_outputs)
+                
+                # Send the tool results back to the model
+                follow_up_response = chat.send_message(tool_results_text)
+                
+                # Update the result with the final response
+                result["messages"] = [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": response.text},
+                    {"role": "user", "content": tool_results_text},
+                    {"role": "assistant", "content": follow_up_response.text}
+                ]
+                result["report"] = follow_up_response.text
+                result["tool_outputs"] = tool_outputs
+            else:
+                # No tool calls, just return the response
+                result["messages"] = [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": response.text}
+                ]
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error querying Gemini: {str(e)}")
+            self._log_exception("Gemini query failed")
+            raise GeminiError(f"Error querying Gemini: {str(e)}")
+            
+    def _query_openai(self, user_message: str) -> Dict[str, Any]:
+        """
+        Query the OpenAI model and process any tool calls.
+        
+        Args:
+            user_message: The user's message to send to OpenAI
+            
+        Returns:
+            A dictionary containing the model's response and any tool outputs
+            
+        Raises:
+            OpenAIError: If there's an issue with the OpenAI API
+        """
+        try:
+            logger.info("Sending query to OpenAI")
+            
+            # Initialize result structure
+            result = {
+                "messages": [],
+                "report": "",
+                "tool_outputs": []
+            }
+            
+            # Prepare the message with system instructions
+            messages = [
+                {"role": "system", "content": self.openai_system_instructions},
+                {"role": "user", "content": user_message}
+            ]
+            
+            # Create the OpenAI chat completion with tools
+            response = self.openai_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=self.openai_tools,
+                tool_choice="auto",  # Let the model decide when to use tools
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens
+            )
+            
+            # Extract the response content
+            first_response = response.choices[0].message
+            
+            # Track the conversation
+            result["messages"].append({"role": "user", "content": user_message})
+            result["messages"].append({"role": "assistant", "content": first_response.content or ""})
+            
+            # Process any tool calls
+            if hasattr(first_response, 'tool_calls') and first_response.tool_calls:
+                # Execute each tool call
+                tool_outputs = []
+                tool_call_messages = [first_response]
+                
+                for tool_call in first_response.tool_calls:
+                    # Parse the function call
+                    function_name = tool_call.function.name
+                    tool_name = function_name.capitalize()  # Convert back to our format
+                    
+                    try:
+                        # Parse arguments
+                        function_args = json.loads(tool_call.function.arguments)
+                        
+                        # Execute the tool if it exists in our tools
+                        if tool_name in self.tool_schemas:
+                            tool_result = self.tool_schemas[tool_name]["function"](**function_args)
+                            
+                            # Log the successful tool usage
+                            self._log_tool_usage(tool_name, function_args, True, tool_result)
+                            
+                            # Add to tool outputs
+                            tool_outputs.append({
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call.id,
+                                "args": function_args,
+                                "result": tool_result
+                            })
+                        else:
+                            # Tool not found
+                            error_msg = f"Tool {tool_name} not found"
+                            logger.error(error_msg)
+                            self._log_tool_usage(tool_name, function_args, False, error_msg)
+                            
+                            tool_outputs.append({
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call.id,
+                                "args": function_args,
+                                "error": error_msg
+                            })
+                    
+                    except Exception as e:
+                        # Error executing tool
+                        error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                        logger.error(error_msg)
+                        self._log_tool_usage(tool_name, {}, False, error_msg)
+                        
+                        tool_outputs.append({
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call.id,
+                            "error": error_msg
+                        })
+                
+                # Prepare tool responses for the follow-up message
+                for tool_output in tool_outputs:
+                    if "error" in tool_output:
+                        # Error case
+                        tool_response = {
+                            "tool_call_id": tool_output["tool_call_id"],
+                            "role": "tool",
+                            "name": tool_output["tool_name"].lower(),
+                            "content": f"Error: {tool_output['error']}"
+                        }
+                    else:
+                        # Success case - format the result as JSON
+                        result_json = json.dumps(tool_output["result"])
+                        tool_response = {
+                            "tool_call_id": tool_output["tool_call_id"],
+                            "role": "tool",
+                            "name": tool_output["tool_name"].lower(),
+                            "content": result_json
+                        }
+                    
+                    # Add to messages
+                    tool_call_messages.append(tool_response)
+                
+                # Get a follow-up response from the model with the tool results
+                if tool_outputs:
+                    # Prepare the full conversation history
+                    follow_up_messages = [
+                        {"role": "system", "content": self.openai_system_instructions},
+                        {"role": "user", "content": user_message},
+                        *tool_call_messages
+                    ]
+                    
+                    # Get the follow-up response
+                    follow_up_response = self.openai_client.chat.completions.create(
+                        model=self.model,
+                        messages=follow_up_messages,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        max_tokens=self.max_tokens
+                    )
+                    
+                    final_response = follow_up_response.choices[0].message
+                    
+                    # Update the result
+                    result["report"] = final_response.content
+                    result["messages"].append({"role": "assistant", "content": final_response.content})
+                    result["tool_outputs"] = tool_outputs
+                else:
+                    # No tool outputs were created, just use the initial response
+                    result["report"] = first_response.content or ""
+            else:
+                # No tool calls in the response
+                result["report"] = first_response.content or ""
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error querying OpenAI: {str(e)}")
+            self._log_exception("OpenAI query failed")
+            raise OpenAIError(f"Error querying OpenAI: {str(e)}")
+            
+    def _parse_tool_args(self, args_text: str, tool_name: str) -> Dict[str, Any]:
+        """
+        Parse tool arguments from text.
+        
+        Args:
+            args_text: The text containing the arguments
+            tool_name: The name of the tool
+            
+        Returns:
+            Dictionary of parsed arguments
+        """
+        tool_args = {}
+        
+        # Different parsing logic based on tool type
+        if tool_name == "WebSearch":
+            # Simple case - the text is likely just the query
+            tool_args["query"] = args_text.strip()
+            # Default number of results
+            tool_args["num_results"] = 5
+            
+        elif tool_name == "DocumentAnalysis":
+            # Look for URLs or file paths
+            url_match = re.search(r'https?://[^\s"\']+', args_text)
+            if url_match:
+                tool_args["document_source"] = url_match.group(0)
+            else:
+                # Use the whole text as document source
+                tool_args["document_source"] = args_text.strip()
+                
+        elif tool_name == "InformationExtraction":
+            # This is more complex, needs text and instructions
+            # Try to identify instructions first
+            instruction_match = re.search(r'instructions?[:\s]+([^.]+)', args_text, re.IGNORECASE)
+            if instruction_match:
+                instructions = instruction_match.group(1).strip()
+                # The rest is probably the text
+                text = args_text.replace(instruction_match.group(0), "").strip()
+                tool_args["instructions"] = instructions
+                tool_args["text"] = text
+            else:
+                # Simple splitting - first part is text, second is instructions
+                parts = args_text.split(".", 1)
+                if len(parts) > 1:
+                    tool_args["text"] = parts[0].strip()
+                    tool_args["instructions"] = parts[1].strip()
+                else:
+                    # Can't clearly identify, use defaults
+                    tool_args["text"] = args_text.strip()
+                    tool_args["instructions"] = "Extract key information"
+                    
+        elif tool_name == "CitationGeneration":
+            # Look for claim and source
+            claim_match = re.search(r'claim[:\s]+([^.]+)', args_text, re.IGNORECASE)
+            source_match = re.search(r'source[:\s]+([^.]+)', args_text, re.IGNORECASE)
+            
+            if claim_match:
+                tool_args["claim"] = claim_match.group(1).strip()
+            else:
+                tool_args["claim"] = args_text.strip()
+                
+            if source_match:
+                # Try to parse source as JSON if it looks like it
+                source_text = source_match.group(1).strip()
+                if source_text.startswith("{") and source_text.endswith("}"):
+                    try:
+                        source = json.loads(source_text)
+                        tool_args["source"] = source
+                    except:
+                        # If not valid JSON, use as string
+                        tool_args["source"] = {"text": source_text}
+                else:
+                    tool_args["source"] = {"text": source_text}
+            else:
+                tool_args["source"] = {"text": "Unknown source"}
+        
+        elif tool_name == "DataAnalysis":
+            # Look for data and analysis type
+            analysis_match = re.search(r'analysis[:\s]+([^.]+)', args_text, re.IGNORECASE)
+            if analysis_match:
+                tool_args["analysis_type"] = analysis_match.group(1).strip()
+            else:
+                tool_args["analysis_type"] = "descriptive_statistics"
+                
+            # For data, try to find structured data or just use the text
+            tool_args["data"] = {"text": args_text.strip()}
+            
+        return tool_args
+        
+    def _format_tool_results(self, tool_outputs: List[Dict[str, Any]]) -> str:
+        """
+        Format tool results for sending back to the model.
+        
+        Args:
+            tool_outputs: List of tool outputs
+            
+        Returns:
+            Formatted string with tool results
+        """
+        formatted_results = "I executed the tools you requested. Here are the results:\n\n"
+        
+        for i, output in enumerate(tool_outputs, 1):
+            tool_name = output["tool_name"]
+            formatted_results += f"## Tool {i}: {tool_name}\n\n"
+            
+            if "error" in output:
+                formatted_results += f"Error: {output['error']}\n\n"
+            else:
+                # Format arguments
+                formatted_results += "Arguments:\n"
+                for arg_name, arg_value in output["args"].items():
+                    if isinstance(arg_value, str) and len(arg_value) > 100:
+                        arg_snippet = arg_value[:100] + "..."
+                        formatted_results += f"- {arg_name}: {arg_snippet}\n"
+                    else:
+                        formatted_results += f"- {arg_name}: {arg_value}\n"
+                        
+                # Format result based on tool type
+                formatted_results += "\nResult:\n"
+                result = output["result"]
+                
+                if tool_name == "WebSearch":
+                    formatted_results += f"Found {result.get('num_results', 0)} results for query: '{output['args'].get('query', '')}'.\n\n"
+                    for j, search_result in enumerate(result.get("results", []), 1):
+                        formatted_results += f"{j}. **{search_result.get('title', 'Untitled')}**\n"
+                        formatted_results += f"   Source: {search_result.get('source_name', search_result.get('link', 'Unknown'))}\n"
+                        formatted_results += f"   Snippet: {search_result.get('snippet', 'No description')}\n\n"
+                        
+                elif tool_name == "InformationExtraction":
+                    extracted = result.get("extracted_information", [])
+                    formatted_results += f"Extraction type: {result.get('extraction_type', 'unknown')}\n"
+                    formatted_results += f"Found {len(extracted)} items.\n\n"
+                    
+                    for item in extracted[:5]:  # Limit to prevent too long responses
+                        if isinstance(item, dict):
+                            for k, v in item.items():
+                                if k not in ["context"]:  # Skip verbose fields
+                                    formatted_results += f"- {k}: {v}\n"
+                            formatted_results += "\n"
+                        else:
+                            formatted_results += f"- {item}\n"
+                            
+                elif tool_name == "CitationGeneration":
+                    if result.get("success", False):
+                        formatted_results += f"Citation generated successfully.\n"
+                        formatted_results += f"Citation text: {result.get('citation_text', 'Not available')}\n"
+                        formatted_results += f"Style: {result.get('style', 'Unknown')}\n"
+                    else:
+                        formatted_results += f"Failed to generate citation: {result.get('error', 'Unknown error')}\n"
+                
+                else:
+                    # Generic result formatting for other tools
+                    if isinstance(result, dict):
+                        for k, v in result.items():
+                            if isinstance(v, str) and len(v) > 200:
+                                v = v[:200] + "..."
+                            formatted_results += f"- {k}: {v}\n"
+                    else:
+                        formatted_results += str(result)
+                        
+            formatted_results += "\n---\n\n"
+            
+        formatted_results += "Please continue your research using these results. If you need to use more tools, please indicate clearly which tool you want to use and how."
+        
+        return formatted_results
     
     def _process_agent_output(self, result: Dict[str, Any]) -> None:
         """
